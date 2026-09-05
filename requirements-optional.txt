@@ -1,0 +1,4 @@
+-r requirements.txt
+tiktoken>=0.7,<1
+transformers>=4.40,<5
+datasets>=3,<5
