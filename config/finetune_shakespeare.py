@@ -1,0 +1,13 @@
+out_dir = "out-shakespeare"
+dataset = "shakespeare"
+init_from = "gpt2"
+block_size = 1024
+batch_size = 1
+gradient_accumulation_steps = 32
+max_iters = 20
+learning_rate = 0.00003
+min_lr = 0.000003
+decay_lr = False
+eval_interval = 5
+eval_iters = 40
+always_save_checkpoint = False

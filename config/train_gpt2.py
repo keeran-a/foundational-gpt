@@ -1,0 +1,16 @@
+out_dir = "out-gpt2"
+dataset = "openwebtext"
+batch_size = 12
+block_size = 1024
+n_layer = 12
+n_head = 12
+n_embd = 768
+gradient_accumulation_steps = 40
+learning_rate = 0.0006
+min_lr = 0.00006
+max_iters = 600000
+lr_decay_iters = 600000
+warmup_iters = 2000
+eval_interval = 1000
+eval_iters = 200
+beta2 = 0.95
