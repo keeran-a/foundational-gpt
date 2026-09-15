@@ -17,6 +17,9 @@ class GPTConfig:
     n_embd: int = 384
     dropout: float = 0.0
     bias: bool = True
+    position_embedding: str = "learned"
+    rope_theta: float = 10000.0
+    activation: str = "gelu"
 
     def __post_init__(self):
         dimensions = (self.block_size, self.vocab_size, self.n_layer, self.n_head, self.n_embd)
@@ -26,6 +29,21 @@ class GPTConfig:
             raise ValueError("Embedding width must be divisible by the number of heads")
         if not 0 <= self.dropout < 1:
             raise ValueError("Dropout must be in [0, 1)")
+        if self.position_embedding not in {"learned", "rotary"}:
+            raise ValueError("position_embedding must be learned or rotary")
+        if self.position_embedding == "rotary" and (self.n_embd // self.n_head) % 2:
+            raise ValueError("Rotary embeddings require an even width per attention head")
+        if not math.isfinite(self.rope_theta) or self.rope_theta <= 0:
+            raise ValueError("rope_theta must be positive and finite")
+        if self.activation not in {"gelu", "gelu_tanh"}:
+            raise ValueError("activation must be gelu or gelu_tanh")
+
+
+def apply_rotary(features, cosine, sine):
+    dtype = features.dtype
+    even, odd = features.float()[..., 0::2], features.float()[..., 1::2]
+    rotated = torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), dim=-1)
+    return rotated.flatten(-2).to(dtype)
 
 
 class LayerNorm(nn.Module):
@@ -46,11 +64,22 @@ class Attention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.resid_dropout = nn.Dropout(config.dropout)
+        self.rotary = config.position_embedding == "rotary"
+        if self.rotary:
+            head_width = config.n_embd // config.n_head
+            frequency = config.rope_theta ** (-torch.arange(0, head_width, 2, dtype=torch.float32) / head_width)
+            angles = torch.outer(torch.arange(config.block_size, dtype=torch.float32), frequency)
+            self.register_buffer("rope_cosine", angles.cos(), persistent=False)
+            self.register_buffer("rope_sine", angles.sin(), persistent=False)
 
     def forward(self, features):
         batch, length, width = features.shape
         projected = self.c_attn(features).reshape(batch, length, 3, self.n_head, width // self.n_head)
         query, key, value = projected.permute(2, 0, 3, 1, 4).unbind(0)
+        if self.rotary:
+            cosine, sine = self.rope_cosine[:length], self.rope_sine[:length]
+            query = apply_rotary(query, cosine, sine)
+            key = apply_rotary(key, cosine, sine)
         context = F.scaled_dot_product_attention(
             query, key, value, is_causal=True,
             dropout_p=self.dropout if self.training else 0.0,
@@ -65,9 +94,10 @@ class FeedForward(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
+        self.approximation = "tanh" if config.activation == "gelu_tanh" else "none"
 
     def forward(self, features):
-        return self.dropout(self.c_proj(F.gelu(self.c_fc(features))))
+        return self.dropout(self.c_proj(F.gelu(self.c_fc(features), approximate=self.approximation)))
 
 
 class DecoderLayer(nn.Module):
@@ -88,13 +118,15 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         # Parameter paths retain compatibility with existing GPT-2 checkpoints.
-        self.transformer = nn.ModuleDict({
+        layers = {
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "wpe": nn.Embedding(config.block_size, config.n_embd),
             "drop": nn.Dropout(config.dropout),
             "h": nn.ModuleList(DecoderLayer(config) for _ in range(config.n_layer)),
             "ln_f": LayerNorm(config.n_embd, config.bias),
-        })
+        }
+        if config.position_embedding == "learned":
+            layers = {"wte": layers.pop("wte"), "wpe": nn.Embedding(config.block_size, config.n_embd), **layers}
+        self.transformer = nn.ModuleDict(layers)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight = self.transformer.wte.weight
         self.apply(self._initialize)
@@ -112,15 +144,20 @@ class GPT(nn.Module):
 
     def get_num_params(self, non_embedding=True):
         total = sum(parameter.numel() for parameter in self.parameters())
-        return total - self.transformer.wpe.weight.numel() if non_embedding else total
+        if non_embedding and "wpe" in self.transformer:
+            total -= self.transformer.wpe.weight.numel()
+        return total
 
     def forward(self, tokens, targets=None):
         if tokens.ndim != 2 or not 0 < tokens.shape[1] <= self.config.block_size:
             raise ValueError(f"Expected [batch, length] tokens with length 1..{self.config.block_size}")
         if targets is not None and targets.shape != tokens.shape:
             raise ValueError("Targets must have the same shape as input tokens")
-        positions = torch.arange(tokens.shape[1], device=tokens.device)
-        features = self.transformer.drop(self.transformer.wte(tokens) + self.transformer.wpe(positions))
+        features = self.transformer.wte(tokens)
+        if "wpe" in self.transformer:
+            positions = torch.arange(tokens.shape[1], device=tokens.device)
+            features = features + self.transformer.wpe(positions)
+        features = self.transformer.drop(features)
         for layer in self.transformer.h:
             features = layer(features)
         features = self.transformer.ln_f(features)
@@ -133,8 +170,13 @@ class GPT(nn.Module):
     def crop_block_size(self, block_size):
         if not 0 < block_size <= self.config.block_size:
             raise ValueError("Context can only be reduced to a positive length")
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size].detach().clone())
-        self.transformer.wpe.num_embeddings = block_size
+        if "wpe" in self.transformer:
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size].detach().clone())
+            self.transformer.wpe.num_embeddings = block_size
+        for layer in self.transformer.h:
+            if layer.attn.rotary:
+                layer.attn.rope_cosine = layer.attn.rope_cosine[:block_size]
+                layer.attn.rope_sine = layer.attn.rope_sine[:block_size]
         self.config.block_size = block_size
 
     @classmethod
@@ -151,7 +193,7 @@ class GPT(nn.Module):
         layers, heads, width = sizes[model_type]
         model = cls(GPTConfig(
             block_size=1024, vocab_size=50257, n_layer=layers, n_head=heads,
-            n_embd=width, bias=True, **overrides,
+            n_embd=width, bias=True, activation="gelu_tanh", **overrides,
         ))
         source = GPT2LMHeadModel.from_pretrained(model_type).state_dict()
         cls.import_weights(model.state_dict(), source)

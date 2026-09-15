@@ -36,6 +36,9 @@ class TrainConfig:
     n_embd: int = 128
     dropout: float = 0.0
     bias: bool = False
+    position_embedding: str = "learned"
+    rope_theta: float = 10000.0
+    activation: str = "gelu"
     gradient_accumulation_steps: int = 1
     learning_rate: float = 0.001
     max_iters: int = 2000
@@ -110,6 +113,8 @@ def initialize_model(config, metadata):
             n_layer=config.n_layer, n_head=config.n_head, n_embd=config.n_embd,
             block_size=config.block_size, vocab_size=metadata["vocab_size"],
             bias=config.bias, dropout=config.dropout,
+            position_embedding=config.position_embedding, rope_theta=config.rope_theta,
+            activation=config.activation,
         ))
     elif config.init_from == "resume":
         checkpoint = load_checkpoint(Path(config.out_dir) / "ckpt.pt")
@@ -164,7 +169,7 @@ def train(config):
         step, best_loss = 0, float("inf")
         if checkpoint is not None:
             optimizer.load_state_dict(checkpoint["optimizer"])
-            position_state = optimizer.state.get(model.transformer.wpe.weight, {})
+            position_state = optimizer.state.get(model.transformer.wpe.weight, {}) if "wpe" in model.transformer else {}
             for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
                 if name in position_state:
                     position_state[name] = position_state[name][:config.block_size].contiguous()
