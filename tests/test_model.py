@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from model import GPT, GPTConfig
+from model import GPT, GPTConfig, apply_rotary
 
 
 class ModelTests(unittest.TestCase):
@@ -55,6 +55,38 @@ class ModelTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.model.generate(torch.ones((1, 1), dtype=torch.long), **({"max_new_tokens": 1} | options))
 
+    def test_rotary_forward_backward_and_crop(self):
+        model = GPT(GPTConfig(block_size=8, vocab_size=19, n_layer=2, n_head=2, n_embd=16, position_embedding="rotary")).eval()
+        self.assertNotIn("wpe", model.transformer)
+        self.assertFalse(any("rope_" in name for name in model.state_dict()))
+        self.assertEqual(model.get_num_params(), model.get_num_params(non_embedding=False))
+        tokens = torch.randint(19, (2, 8))
+        logits, loss = model(tokens, tokens)
+        loss.backward()
+        self.assertEqual(logits.shape, (2, 8, 19))
+        self.assertTrue(all(torch.isfinite(parameter.grad).all() for parameter in model.parameters()))
+        changed = tokens.clone()
+        changed[:, 4:] = (changed[:, 4:] + 1) % 19
+        other, _ = model(changed, changed)
+        torch.testing.assert_close(logits[:, :4], other[:, :4], rtol=0, atol=0)
+        model.crop_block_size(4)
+        self.assertEqual(model.transformer.h[0].attn.rope_cosine.shape[0], 4)
+        self.assertEqual(model.generate(tokens, 3, top_k=1).shape, (2, 11))
+
+    def test_rotary_relative_position_and_norm(self):
+        query, key = torch.randn(3, 8), torch.randn(3, 8)
+        frequency = 10000.0 ** (-torch.arange(0, 8, 2) / 8)
+        angles = torch.arange(3)[:, None] * frequency
+        def scores(offset):
+            phases = angles + offset * frequency
+            rotated_query = apply_rotary(query, phases.cos(), phases.sin())
+            rotated_key = apply_rotary(key, phases.cos(), phases.sin())
+            torch.testing.assert_close(rotated_query.norm(dim=-1), query.norm(dim=-1))
+            return rotated_query @ rotated_key.t()
+        torch.testing.assert_close(scores(0), scores(5), rtol=1e-5, atol=1e-6)
+        with self.assertRaises(ValueError):
+            GPTConfig(n_head=2, n_embd=6, position_embedding="rotary")
+
     @unittest.skipUnless(importlib.util.find_spec("transformers"), "optional transformers dependency")
     def test_gpt2_parameter_import(self):
         from transformers import GPT2Config, GPT2LMHeadModel
@@ -66,6 +98,18 @@ class ModelTests(unittest.TestCase):
         tokens = torch.randint(19, (2, 8))
         logits, _ = self.model(tokens, tokens)
         torch.testing.assert_close(logits, reference(tokens).logits, rtol=1e-5, atol=1e-6)
+
+    @unittest.skipUnless(importlib.util.find_spec("transformers"), "optional transformers dependency")
+    def test_gpt2_tanh_activation_matches_default(self):
+        from transformers import GPT2Config, GPT2LMHeadModel
+        reference = GPT2LMHeadModel(GPT2Config(
+            vocab_size=19, n_positions=8, n_layer=2, n_head=2, n_embd=16,
+            attn_pdrop=0, resid_pdrop=0, embd_pdrop=0,
+        )).eval()
+        model = GPT(GPTConfig(block_size=8, vocab_size=19, n_layer=2, n_head=2, n_embd=16, activation="gelu_tanh")).eval()
+        GPT.import_weights(model.state_dict(), reference.state_dict())
+        tokens = torch.randint(19, (2, 8))
+        torch.testing.assert_close(model(tokens, tokens)[0], reference(tokens).logits, rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":

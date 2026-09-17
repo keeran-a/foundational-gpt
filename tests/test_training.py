@@ -59,6 +59,14 @@ class TrainingTests(unittest.TestCase):
             sample(SampleConfig(out_dir=self.config.out_dir, start="ab", max_new_tokens=5, device="cpu", top_k=1))
         self.assertEqual(len(output.getvalue()), 8)
 
+    def test_rotary_resume_preserves_architecture(self):
+        config = replace(self.config, position_embedding="rotary", max_iters=2)
+        self.run_training(config)
+        resumed = self.run_training(replace(config, init_from="resume", max_iters=4, position_embedding="learned"))
+        self.assertEqual(resumed["model_args"]["position_embedding"], "rotary")
+        self.assertEqual(resumed["iter_num"], 4)
+        self.assertNotIn("transformer.wpe.weight", resumed["model"])
+
     def test_batches_and_tokenizer(self):
         tokenizer = Tokenizer(read_metadata(self.root / "text"))
         self.assertEqual(tokenizer.decode(tokenizer.encode("abc\n")), "abc\n")
