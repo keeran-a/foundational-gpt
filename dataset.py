@@ -71,9 +71,12 @@ class TokenDataset:
             mapping._mmap.close()
         self.splits.clear()
 
-    def batch(self, split):
+    def batch(self, split, batch_size=None):
+        batch_size = self.batch_size if batch_size is None else batch_size
+        if batch_size <= 0:
+            raise ValueError("Batch size must be positive")
         tokens = self.splits[split]
-        starts = torch.randint(len(tokens) - self.block_size, (self.batch_size,)).numpy()
+        starts = torch.randint(len(tokens) - self.block_size, (batch_size,)).numpy()
         offsets = starts[:, None] + np.arange(self.block_size + 1)
         window = torch.from_numpy(np.asarray(tokens[offsets], dtype=np.int64))
         if self.device.type == "cuda":

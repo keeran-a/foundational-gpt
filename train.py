@@ -30,6 +30,8 @@ class TrainConfig:
     eval_iters: int = 20
     log_interval: int = 10
     batch_size: int = 12
+    batch_size_start: int = 0
+    batch_size_ramp_iters: int = 0
     block_size: int = 64
     n_layer: int = 4
     n_head: int = 4
@@ -69,6 +71,23 @@ class TrainConfig:
             raise ValueError("Require 0 <= min_lr <= learning_rate and learning_rate > 0")
         if not 0 <= self.beta1 < 1 or not 0 <= self.beta2 < 1 or self.weight_decay < 0:
             raise ValueError("Invalid AdamW settings")
+        if self.batch_size_start or self.batch_size_ramp_iters:
+            if not 0 < self.batch_size_start <= self.batch_size or self.batch_size_ramp_iters <= 0:
+                raise ValueError("Batch ramping requires a positive starting size no larger than batch_size and positive ramp iterations")
+
+
+def batch_size_at(step, config):
+    if not config.batch_size_ramp_iters:
+        return config.batch_size
+    progress = min(max(step, 0), config.batch_size_ramp_iters)
+    return config.batch_size_start + (config.batch_size - config.batch_size_start) * progress // config.batch_size_ramp_iters
+
+
+def perplexity(loss):
+    try:
+        return math.exp(loss)
+    except OverflowError:
+        return float("inf")
 
 
 def learning_rate_at(step, config):
@@ -120,7 +139,7 @@ def initialize_model(config, metadata):
         checkpoint = load_checkpoint(Path(config.out_dir) / "ckpt.pt")
         if checkpoint.get("tokenizer", metadata) != metadata:
             raise ValueError("Dataset tokenizer differs from the checkpoint tokenizer")
-        model = GPT(GPTConfig(**(checkpoint["model_args"] | {"dropout": config.dropout})))
+        model = GPT(GPTConfig(**checkpoint["model_args"]))
         model.load_state_dict(checkpoint["model"])
     elif config.init_from.startswith("gpt2"):
         if metadata["kind"] != "gpt2":
@@ -163,10 +182,13 @@ def train(config):
         metadata = read_metadata(Path(config.data_dir) / config.dataset)
         data = TokenDataset(Path(config.data_dir) / config.dataset, config.block_size, config.batch_size, device)
         model, checkpoint = initialize_model(config, metadata)
+        for name in ("n_layer", "n_head", "n_embd", "dropout", "bias", "position_embedding", "rope_theta", "activation"):
+            setattr(config, name, getattr(model.config, name))
         model.to(device)
         optimizer = model.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2), device.type)
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and config.dtype == "float16")
         step, best_loss = 0, float("inf")
+        clipped_updates = 0
         if checkpoint is not None:
             optimizer.load_state_dict(checkpoint["optimizer"])
             position_state = optimizer.state.get(model.transformer.wpe.weight, {}) if "wpe" in model.transformer else {}
@@ -174,6 +196,7 @@ def train(config):
                 if name in position_state:
                     position_state[name] = position_state[name][:config.block_size].contiguous()
             step, best_loss = checkpoint["iter_num"], checkpoint["best_val_loss"]
+            clipped_updates = checkpoint.get("clipped_updates", 0)
             if "scaler" in checkpoint:
                 scaler.load_state_dict(checkpoint["scaler"])
         if config.compile:
@@ -203,6 +226,7 @@ def train(config):
                     "model": model.state_dict(), "model_args": asdict(model.config),
                     "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
                     "iter_num": step, "best_val_loss": best_loss,
+                    "clipped_updates": clipped_updates,
                     "config": asdict(config), "tokenizer": metadata, "rng_states": states,
                 })
 
@@ -216,7 +240,7 @@ def train(config):
                 improved = losses["val"] < best_loss
                 best_loss = min(best_loss, losses["val"])
                 if rank == 0:
-                    print(f"step {step}: train {losses['train']:.4f}, validation {losses['val']:.4f}", flush=True)
+                    print(f"step {step}: train {losses['train']:.4f}, validation {losses['val']:.4f}, val perplexity {perplexity(losses['val']):.3f}", flush=True)
                 if config.eval_only:
                     break
                 if improved:
@@ -230,24 +254,30 @@ def train(config):
                 group["lr"] = rate
             started = time.perf_counter()
             total_loss = 0.0
+            current_batch_size = batch_size_at(step, config)
             for micro_step in range(accumulation):
                 sync = execution_model.no_sync() if world_size > 1 and micro_step < accumulation - 1 else nullcontext()
-                inputs, targets = data.batch("train")
+                inputs, targets = data.batch("train", current_batch_size)
                 with sync:
                     with autocast():
                         _, loss = execution_model(inputs, targets)
                         loss = loss / accumulation
+                    if not torch.isfinite(loss).item():
+                        raise FloatingPointError(f"Non-finite training loss at step {step}")
                     total_loss += loss.detach().item()
                     scaler.scale(loss).backward()
-            if config.grad_clip:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            scaler.unscale_(optimizer)
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), config.grad_clip or float("inf"), error_if_nonfinite=not scaler.is_enabled(),
+            ).item()
+            if config.grad_clip and math.isfinite(gradient_norm) and gradient_norm > config.grad_clip:
+                clipped_updates += 1
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             step += 1
             if rank == 0 and step % config.log_interval == 0:
-                print(f"step {step}: loss {total_loss:.4f}, lr {rate:.6g}, time {time.perf_counter() - started:.3f}s", flush=True)
+                print(f"step {step}: loss {total_loss:.4f}, lr {rate:.6g}, batch {current_batch_size}, grad norm {gradient_norm:.4f}, clipped updates {clipped_updates}, time {time.perf_counter() - started:.3f}s", flush=True)
     finally:
         if data is not None:
             data.close()
