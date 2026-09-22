@@ -14,7 +14,7 @@ from prepare import prepare_text
 from runtime import load_checkpoint
 from sample import SampleConfig, sample
 from settings import load_settings
-from train import TrainConfig, learning_rate_at, train
+from train import TrainConfig, batch_size_at, learning_rate_at, perplexity, train
 
 
 class TrainingTests(unittest.TestCase):
@@ -62,10 +62,41 @@ class TrainingTests(unittest.TestCase):
     def test_rotary_resume_preserves_architecture(self):
         config = replace(self.config, position_embedding="rotary", max_iters=2)
         self.run_training(config)
-        resumed = self.run_training(replace(config, init_from="resume", max_iters=4, position_embedding="learned"))
+        resumed = self.run_training(replace(config, init_from="resume", max_iters=4, position_embedding="learned", dropout=0.0))
         self.assertEqual(resumed["model_args"]["position_embedding"], "rotary")
+        self.assertEqual(resumed["model_args"]["dropout"], config.dropout)
         self.assertEqual(resumed["iter_num"], 4)
         self.assertNotIn("transformer.wpe.weight", resumed["model"])
+
+    def test_batch_ramp_schedule_and_resume(self):
+        config = replace(self.config, batch_size=4, batch_size_start=1, batch_size_ramp_iters=3)
+        self.assertEqual([batch_size_at(step, config) for step in range(5)], [1, 2, 3, 4, 4])
+        full = self.run_training(config)
+        partial = replace(config, out_dir=str(self.root / "ramp-resumed"), max_iters=2)
+        self.run_training(partial)
+        resumed = self.run_training(replace(partial, init_from="resume", max_iters=4))
+        for name in full["model"]:
+            torch.testing.assert_close(full["model"][name], resumed["model"][name], rtol=0, atol=0)
+        with self.assertRaises(ValueError):
+            replace(config, batch_size_start=5)
+        with self.assertRaises(ValueError):
+            replace(config, batch_size_ramp_iters=0)
+
+    def test_health_logging_and_perplexity(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            train(replace(self.config, max_iters=1, grad_clip=0.00001, log_interval=1))
+        self.assertIn("grad norm ", output.getvalue())
+        self.assertIn("clipped updates 1", output.getvalue())
+        self.assertIn("val perplexity ", output.getvalue())
+        self.assertEqual(perplexity(0), 1)
+        self.assertEqual(perplexity(1000), float("inf"))
+
+    def test_finetuning_has_warmup_and_decay(self):
+        path = Path(__file__).resolve().parents[1] / "config" / "finetune_shakespeare.py"
+        config = load_settings(TrainConfig, [str(path)])
+        self.assertLess(learning_rate_at(0, config), learning_rate_at(config.warmup_iters, config))
+        self.assertEqual(learning_rate_at(config.max_iters, config), config.min_lr)
 
     def test_batches_and_tokenizer(self):
         tokenizer = Tokenizer(read_metadata(self.root / "text"))
