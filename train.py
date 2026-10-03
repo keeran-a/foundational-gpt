@@ -136,7 +136,7 @@ def initialize_model(config, metadata):
             activation=config.activation,
         ))
     elif config.init_from == "resume":
-        checkpoint = load_checkpoint(Path(config.out_dir) / "ckpt.pt")
+        checkpoint = load_checkpoint(Path(config.out_dir) / "ckpt.pt", training=True)
         if checkpoint.get("tokenizer", metadata) != metadata:
             raise ValueError("Dataset tokenizer differs from the checkpoint tokenizer")
         model = GPT(GPTConfig(**checkpoint["model_args"]))
@@ -215,19 +215,21 @@ def train(config):
         checkpoint = None
 
         def persist(filename):
-            state = {"cpu": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None}
-            states = [None] * world_size
-            if world_size > 1:
-                distributed.all_gather_object(states, state)
-            else:
-                states[0] = state
+            training_state = {}
+            if filename == "ckpt.pt":
+                state = {"cpu": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None}
+                states = [None] * world_size
+                if world_size > 1:
+                    distributed.all_gather_object(states, state)
+                else:
+                    states[0] = state
+                training_state = {"optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(), "rng_states": states}
             if rank == 0:
                 save_checkpoint(Path(config.out_dir) / filename, {
                     "model": model.state_dict(), "model_args": asdict(model.config),
-                    "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
                     "iter_num": step, "best_val_loss": best_loss,
                     "clipped_updates": clipped_updates,
-                    "config": asdict(config), "tokenizer": metadata, "rng_states": states,
+                    "config": asdict(config), "tokenizer": metadata, **training_state,
                 })
 
         if rank == 0:
