@@ -53,6 +53,8 @@ class TrainingTests(unittest.TestCase):
     def test_final_checkpoint_and_portable_sampling(self):
         result = self.run_training(replace(self.config, max_iters=1, eval_interval=100, always_save_checkpoint=False))
         self.assertEqual(result["iter_num"], 1)
+        self.assertNotIn("optimizer", result)
+        (Path(self.config.out_dir) / result["training_state_file"]).unlink()
         (self.root / "text" / "meta.json").unlink()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
