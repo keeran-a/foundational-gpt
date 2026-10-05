@@ -15,3 +15,4 @@ CUDA is selected when available. Checkpoints are saved in `out/`; use `--checkpo
 
 Train with rotary positions using `python train.py config/train_rotary.py`.
 Optional batch ramp: `--batch_size_start=4 --batch_size_ramp_iters=500`. Training reports validation perplexity, gradient norms, and clipping counts.
+Keep the matching `ckpt.train-*.pt` file with `ckpt.pt` to resume; sampling needs only the model checkpoint.
