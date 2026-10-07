@@ -213,13 +213,15 @@ class GPT(nn.Module):
                 raise ValueError(f"Pretrained parameter shape mismatch: {name}")
             target.copy_(value)
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, sharded=False):
         parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
         groups = [
             {"params": [p for p in parameters if p.ndim >= 2], "weight_decay": weight_decay},
             {"params": [p for p in parameters if p.ndim < 2], "weight_decay": 0.0},
         ]
-        return torch.optim.AdamW(groups, lr=learning_rate, betas=betas, fused=device_type == "cuda")
+        return torch.optim.AdamW(groups, lr=learning_rate, betas=betas,
+                                 fused=device_type == "cuda" and not sharded,
+                                 foreach=False if sharded else None)
 
     @torch.no_grad()
     def generate(self, tokens, max_new_tokens, temperature=1.0, top_k=None):

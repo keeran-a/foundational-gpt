@@ -3,7 +3,6 @@
 import math
 import os
 import time
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from dataset import TokenDataset, read_metadata
 from model import GPT, GPTConfig
+from parallel import checkpoint_states, gradient_sync, restore_optimizer, shard_model, validate_fsdp
 from runtime import default_device, load_checkpoint, precision, save_checkpoint
 from settings import load_settings
 
@@ -55,11 +55,14 @@ class TrainConfig:
     device: str = "auto"
     dtype: str = "auto"
     backend: str = "auto"
+    parallelism: str = "ddp"
     init_method: str = "env://"
     compile: bool = False
     seed: int = 1337
 
     def __post_init__(self):
+        if self.parallelism not in {"ddp", "fsdp"}:
+            raise ValueError("parallelism must be ddp or fsdp")
         for name in ("eval_interval", "eval_iters", "log_interval", "batch_size", "block_size", "gradient_accumulation_steps"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -169,6 +172,10 @@ def train(config):
             config.device = f"cuda:{torch.cuda.current_device()}"
             device = torch.device(config.device)
         torch.cuda.set_device(device)
+    sharded = config.parallelism == "fsdp"
+    if sharded:
+        selected_dtype = precision(device, config.dtype)[0]
+        validate_fsdp(device, world_size, selected_dtype, config.compile)
     if config.gradient_accumulation_steps % world_size:
         raise ValueError("gradient_accumulation_steps must be divisible by world size")
     accumulation = config.gradient_accumulation_steps // world_size
@@ -185,25 +192,23 @@ def train(config):
         for name in ("n_layer", "n_head", "n_embd", "dropout", "bias", "position_embedding", "rope_theta", "activation"):
             setattr(config, name, getattr(model.config, name))
         model.to(device)
-        optimizer = model.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2), device.type)
+        if sharded:
+            shard_model(model, device, world_size)
+        optimizer = model.configure_optimizers(config.weight_decay, config.learning_rate, (config.beta1, config.beta2), device.type, sharded=sharded)
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and config.dtype == "float16")
         step, best_loss = 0, float("inf")
         clipped_updates = 0
         if checkpoint is not None:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            position_state = optimizer.state.get(model.transformer.wpe.weight, {}) if "wpe" in model.transformer else {}
-            for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-                if name in position_state:
-                    position_state[name] = position_state[name][:config.block_size].contiguous()
+            restore_optimizer(model, optimizer, checkpoint, sharded)
             step, best_loss = checkpoint["iter_num"], checkpoint["best_val_loss"]
             clipped_updates = checkpoint.get("clipped_updates", 0)
-            if "scaler" in checkpoint:
+            if scaler.is_enabled() and checkpoint.get("scaler"):
                 scaler.load_state_dict(checkpoint["scaler"])
         if config.compile:
             execution_model = torch.compile(model)
         else:
             execution_model = model
-        if world_size > 1:
+        if world_size > 1 and not sharded:
             execution_model = DistributedDataParallel(execution_model, device_ids=[local_rank] if device.type == "cuda" else None)
         if checkpoint is not None and "rng_states" in checkpoint:
             states = checkpoint["rng_states"]
@@ -215,6 +220,7 @@ def train(config):
         checkpoint = None
 
         def persist(filename):
+            weights, optimizer_state = checkpoint_states(model, optimizer, sharded, filename == "ckpt.pt")
             training_state = {}
             if filename == "ckpt.pt":
                 state = {"cpu": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None}
@@ -223,22 +229,27 @@ def train(config):
                     distributed.all_gather_object(states, state)
                 else:
                     states[0] = state
-                training_state = {"optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(), "rng_states": states}
+                training_state = {"optimizer": optimizer_state, "scaler": scaler.state_dict(), "rng_states": states}
             if rank == 0:
                 save_checkpoint(Path(config.out_dir) / filename, {
-                    "model": model.state_dict(), "model_args": asdict(model.config),
+                    "model": weights, "model_args": asdict(model.config),
+                    "optimizer_format": "named" if sharded else "indexed",
                     "iter_num": step, "best_val_loss": best_loss,
                     "clipped_updates": clipped_updates,
                     "config": asdict(config), "tokenizer": metadata, **training_state,
                 })
+            if world_size > 1:
+                distributed.barrier()
 
         if rank == 0:
-            print(f"parameters: {model.get_num_params():,}; device: {device}; dtype: {config.dtype}")
+            print(f"parameters: {model.get_num_params():,}; device: {device}; dtype: {config.dtype}; parallelism: {config.parallelism}")
         model.train()
         optimizer.zero_grad(set_to_none=True)
         while True:
             if step % config.eval_interval == 0 or step >= config.max_iters or config.eval_only:
                 losses = evaluate(model, data, config.eval_iters, autocast)
+                if sharded:
+                    model.reshard()
                 improved = losses["val"] < best_loss
                 best_loss = min(best_loss, losses["val"])
                 if rank == 0:
@@ -258,9 +269,8 @@ def train(config):
             total_loss = 0.0
             current_batch_size = batch_size_at(step, config)
             for micro_step in range(accumulation):
-                sync = execution_model.no_sync() if world_size > 1 and micro_step < accumulation - 1 else nullcontext()
                 inputs, targets = data.batch("train", current_batch_size)
-                with sync:
+                with gradient_sync(execution_model, config.parallelism, micro_step == accumulation - 1, world_size > 1):
                     with autocast():
                         _, loss = execution_model(inputs, targets)
                         loss = loss / accumulation
