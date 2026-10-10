@@ -16,3 +16,16 @@ CUDA is selected when available. Checkpoints are saved in `out/`; use `--checkpo
 Train with rotary positions using `python train.py config/train_rotary.py`.
 Optional batch ramp: `--batch_size_start=4 --batch_size_ramp_iters=500`. Training reports validation perplexity, gradient norms, and clipping counts.
 Keep the matching `ckpt.train-*.pt` file with `ckpt.pt` to resume; sampling needs only the model checkpoint.
+
+DDP is the default distributed backend. Optional FSDP2 requires PyTorch 2.14+, two or more workers, float32 or CUDA bfloat16, and `--compile=False`:
+```sh
+torchrun --standalone --nproc_per_node=2 train.py --parallelism=fsdp --gradient_accumulation_steps=2
+```
+Add `--device=cpu` for CPU training. Resume with the same worker count; checkpoints work with either backend. Checkpoint export gathers full weights and optimizer buffers into rank-zero CPU memory.
+
+Windows PowerShell CPU launch:
+```powershell
+$env:TORCH_DISABLE_SHARE_RDZV_TCP_STORE = '1'
+$store = Join-Path $env:TEMP ('gpt-rdzv-' + [guid]::NewGuid())
+torchrun --rdzv_backend=c10d "--rdzv_endpoint=$store" --rdzv_conf=store_type=file --nproc_per_node=2 train.py --parallelism=fsdp --device=cpu --gradient_accumulation_steps=2
+```
